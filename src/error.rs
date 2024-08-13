@@ -31,6 +31,8 @@ pub enum DatabaseError {
     BlockNotFound(BlockId),
     #[error("failed to get transaction {0}: {1}")]
     GetTransaction(B256, Arc<eyre::Error>),
+    #[error("failed to get bytecode for {0:?}: {1}")]
+    GetBytecode(B256, Arc<eyre::Error>),
 }
 
 impl DatabaseError {
@@ -43,6 +45,7 @@ impl DatabaseError {
             Self::GetTransaction(_, err) => Some(err),
             // Enumerate explicitly to make sure errors are updated if a new one is added.
             Self::MissingCode(_) | Self::Recv(_) | Self::Send(_) | Self::BlockNotFound(_) => None,
+            Self::GetBytecode(_, err) => Some(err),
         }
     }
 
