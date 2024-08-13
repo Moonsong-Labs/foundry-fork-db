@@ -5,10 +5,10 @@ use crate::{
     error::{DatabaseError, DatabaseResult},
 };
 use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
-use alloy_provider::{network::AnyNetwork, Provider};
+use alloy_provider::{network::AnyNetwork, Provider, RootProvider};
 use alloy_rpc_types::{Block, BlockId, Transaction};
 use alloy_serde::WithOtherFields;
-use alloy_transport::Transport;
+use alloy_transport::{Transport, TransportResult};
 use eyre::WrapErr;
 use futures::{
     channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
@@ -63,6 +63,8 @@ type TransactionFuture<Err> = Pin<
             + Send,
     >,
 >;
+type BytecodeHashFuture<Err> =
+    Pin<Box<dyn Future<Output = (ByteCodeHashSender, Result<Option<Bytecode>, Err>, B256)> + Send>>;
 
 type AccountInfoSender = OneshotSender<DatabaseResult<AccountInfo>>;
 type StorageSender = OneshotSender<DatabaseResult<U256>>;
@@ -70,6 +72,7 @@ type BlockHashSender = OneshotSender<DatabaseResult<B256>>;
 type FullBlockSender =
     OneshotSender<DatabaseResult<WithOtherFields<Block<WithOtherFields<Transaction>>>>>;
 type TransactionSender = OneshotSender<DatabaseResult<WithOtherFields<Transaction>>>;
+type ByteCodeHashSender = OneshotSender<DatabaseResult<Bytecode>>;
 
 type AddressData = AddressHashMap<AccountInfo>;
 type StorageData = AddressHashMap<StorageInfo>;
@@ -82,6 +85,7 @@ enum ProviderRequest<Err> {
     BlockHash(BlockHashFuture<Err>),
     FullBlock(FullBlockFuture<Err>),
     Transaction(TransactionFuture<Err>),
+    ByteCodeHash(BytecodeHashFuture<Err>),
 }
 
 /// The Request type the Backend listens for
@@ -99,13 +103,22 @@ enum BackendRequest {
     Transaction(B256, TransactionSender),
     /// Sets the pinned block to fetch data from
     SetPinnedBlock(BlockId),
-
     /// Update Address data
     UpdateAddress(AddressData),
     /// Update Storage data
     UpdateStorage(StorageData),
     /// Update Block Hashes
     UpdateBlockHash(BlockHashData),
+    /// Get the bytecode for the given hash
+    ByteCodeHash(B256, ByteCodeHashSender),
+}
+
+pub trait ZkSyncMiddleware: Send + Sync {
+    fn get_bytecode_by_hash(
+        &self,
+        hash: B256,
+    ) -> impl std::future::Future<Output = alloy_transport::TransportResult<Option<Bytecode>>>
+           + std::marker::Send;
 }
 
 /// Handles an internal provider and listens for requests.
@@ -138,7 +151,7 @@ pub struct BackendHandler<T, P> {
 impl<T, P> BackendHandler<T, P>
 where
     T: Transport + Clone,
-    P: Provider<T, AnyNetwork> + Clone + Unpin + 'static,
+    P: ZkSyncMiddleware + Provider<T, AnyNetwork> + Clone + Unpin + 'static,
 {
     fn new(
         provider: P,
@@ -219,6 +232,9 @@ where
                 for (block, hash) in block_hash_data {
                     self.db.block_hashes().write().insert(block, hash);
                 }
+            }
+            BackendRequest::ByteCodeHash(code_hash, sender) => {
+                self.request_bytecode_by_hash(code_hash, sender);
             }
         }
     }
@@ -341,12 +357,25 @@ where
             }
         }
     }
+
+    fn request_bytecode_by_hash(&mut self, code_hash: B256, sender: ByteCodeHashSender) {
+        let provider = self.provider.clone();
+        let fut = Box::pin(async move {
+            let bytecode = provider
+                .get_bytecode_by_hash(code_hash)
+                .await
+                .wrap_err("could not get bytecode {code_hash}");
+            (sender, bytecode, code_hash)
+        });
+
+        self.pending_requests.push(ProviderRequest::ByteCodeHash(fut));
+    }
 }
 
 impl<T, P> Future for BackendHandler<T, P>
 where
     T: Transport + Clone + Unpin,
-    P: Provider<T, AnyNetwork> + Clone + Unpin + 'static,
+    P: ZkSyncMiddleware + Provider<T, AnyNetwork> + Clone + Unpin + 'static,
 {
     type Output = ();
 
@@ -512,6 +541,20 @@ where
                             continue;
                         }
                     }
+                    ProviderRequest::ByteCodeHash(fut) => {
+                        if let Poll::Ready((sender, bytecode, code_hash)) = fut.poll_unpin(cx) {
+                            let msg = match bytecode {
+                                Ok(Some(bytecode)) => Ok(bytecode),
+                                Ok(None) => Err(DatabaseError::MissingCode(code_hash)),
+                                Err(err) => {
+                                    let err = Arc::new(err);
+                                    Err(DatabaseError::GetBytecode(code_hash, err))
+                                }
+                            };
+                            let _ = sender.send(msg);
+                            continue;
+                        }
+                    }
                 }
                 // not ready, insert and poll again
                 pin.pending_requests.push(request);
@@ -606,7 +649,7 @@ impl SharedBackend {
     ) -> Self
     where
         T: Transport + Clone + Unpin,
-        P: Provider<T, AnyNetwork> + Unpin + 'static + Clone,
+        P: ZkSyncMiddleware + Provider<T, AnyNetwork> + Unpin + 'static + Clone,
     {
         let (shared, handler) = Self::new(provider, db, pin_block);
         // spawn the provider handler to a task
@@ -624,7 +667,7 @@ impl SharedBackend {
     ) -> Self
     where
         T: Transport + Clone + Unpin,
-        P: Provider<T, AnyNetwork> + Unpin + 'static + Clone,
+        P: ZkSyncMiddleware + Provider<T, AnyNetwork> + Unpin + 'static + Clone,
     {
         let (shared, handler) = Self::new(provider, db, pin_block);
 
@@ -654,7 +697,7 @@ impl SharedBackend {
     ) -> (Self, BackendHandler<T, P>)
     where
         T: Transport + Clone + Unpin,
-        P: Provider<T, AnyNetwork> + Unpin + 'static + Clone,
+        P: ZkSyncMiddleware + Provider<T, AnyNetwork> + Unpin + 'static + Clone,
     {
         let (backend, backend_rx) = unbounded();
         let cache = Arc::new(FlushJsonBlockCacheDB(Arc::clone(db.cache())));
@@ -758,6 +801,14 @@ impl SharedBackend {
             }
         }
     }
+    fn do_get_bytecode(&self, hash: B256) -> DatabaseResult<Bytecode> {
+        tokio::task::block_in_place(|| {
+            let (sender, rx) = oneshot_channel();
+            let req = BackendRequest::ByteCodeHash(hash, sender);
+            self.backend.clone().try_send(req)?;
+            rx.recv()?
+        })
+    }
 
     /// Flushes the DB to disk if caching is enabled
     pub fn flush_cache(&self) {
@@ -820,7 +871,14 @@ impl DatabaseRef for SharedBackend {
     }
 
     fn code_by_hash_ref(&self, hash: B256) -> Result<Bytecode, Self::Error> {
-        Err(DatabaseError::MissingCode(hash))
+        trace!(target: "sharedbackend", %hash, "request codehash");
+        self.do_get_bytecode(hash).map_err(|err| {
+            error!(target: "sharedbackend", %err, %hash, "Failed to send/recv `code_by_hash`");
+            if err.is_possibly_non_archive_node_error() {
+                error!(target: "sharedbackend", "{NON_ARCHIVE_NODE_WARNING}");
+            }
+            err
+        })
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
@@ -1234,5 +1292,29 @@ mod tests {
 
         // erase the temporary file
         fs::remove_file("test-data/storage-tmp.json").unwrap();
+    }
+}
+
+impl<T: alloy_transport::Transport + Clone> super::backend::ZkSyncMiddleware
+    for RootProvider<T, alloy_provider::network::AnyNetwork>
+{
+    async fn get_bytecode_by_hash(
+        &self,
+        hash: alloy_primitives::B256,
+    ) -> TransportResult<Option<revm::primitives::Bytecode>> {
+        let bytecode: Option<alloy_primitives::Bytes> =
+            self.raw_request("zks_getBytecodeByHash".into(), vec![hash]).await?;
+        Ok(bytecode.map(revm::primitives::Bytecode::new_raw))
+    }
+}
+
+impl<T: alloy_transport::Transport + Clone> super::backend::ZkSyncMiddleware
+    for Arc<RootProvider<T, alloy_provider::network::AnyNetwork>>
+{
+    async fn get_bytecode_by_hash(
+        &self,
+        hash: alloy_primitives::B256,
+    ) -> TransportResult<Option<revm::primitives::Bytecode>> {
+        self.as_ref().get_bytecode_by_hash(hash).await
     }
 }
