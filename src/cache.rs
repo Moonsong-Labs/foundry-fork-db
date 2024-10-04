@@ -7,7 +7,7 @@ use revm::{
 };
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -446,9 +446,9 @@ impl<'de> Deserialize<'de> for JsonBlockCacheData {
         #[derive(Deserialize)]
         struct Data {
             meta: BlockchainDbMeta,
-            accounts: HashMap<Address, AccountInfo>,
-            storage: HashMap<Address, HashMap<U256, U256>>,
-            block_hashes: HashMap<U256, B256>,
+            accounts: Map<Address, AccountInfo>,
+            storage: Map<Address, StorageInfo>,
+            block_hashes: Map<U256, B256>,
         }
 
         let Data { meta, accounts, storage, block_hashes } = Data::deserialize(deserializer)?;
