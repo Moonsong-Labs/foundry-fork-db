@@ -801,11 +801,12 @@ impl SharedBackend {
             }
         }
     }
+
     fn do_get_bytecode(&self, hash: B256) -> DatabaseResult<Bytecode> {
         tokio::task::block_in_place(|| {
             let (sender, rx) = oneshot_channel();
             let req = BackendRequest::ByteCodeHash(hash, sender);
-            self.backend.clone().try_send(req)?;
+            self.backend.clone().unbounded_send(req)?;
             rx.recv()?
         })
     }
